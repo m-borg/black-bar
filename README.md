@@ -26,17 +26,17 @@ No Accessibility, Screen Recording, or extra system permissions required.
   - **Quit BlackBar** (`⌘Q`) — Cleanly restores your original wallpaper on exit.
 - **Automatic Wallpaper Sync:**
   - Detects when you change wallpapers or switch macOS Spaces using `NSWorkspace` notifications and a zero-idle-CPU `kqueue` file watcher on `~/Library/Application Support/com.apple.wallpaper/Store`.
-  - Uses a sleep-aware fallback timer (`10s` interval with `5s` timer coalescing) that pauses while your screen or Mac is asleep.
+  - Only falls back to a low-frequency timer (`60s` interval with `30s` timer coalescing) if `kqueue` cannot attach, and pauses/debounces across sleep and wake events.
 - **Zero Bloat:**
   - Single-file Swift app (`AppDelegate.swift`) using only `Cocoa` and `ServiceManagement`.
-  - Automatically cleans up older generated wallpaper PNGs from `~/Library/Application Support/blackbar.BlackBar/`.
+  - Generates opaque 24-bit RGB wallpaper PNGs (no redundant alpha channel) and automatically cleans up older files from `~/Library/Application Support/blackbar.BlackBar/`.
 
 ---
 
 ## Installation
 
 ### Download Release
-1. Download `BlackBar-v1.1.zip` from the [Releases](https://github.com/m-borg/black-bar/releases) page.
+1. Download `BlackBar-v1.2.zip` from the [Releases](https://github.com/m-borg/black-bar/releases) page.
 2. Unzip it and move `BlackBar.app` into `/Applications`.
 3. Launch `BlackBar.app` *(if macOS Gatekeeper warns on first launch because the app is ad-hoc signed, right-click `BlackBar.app` → **Open**, or allow it under **System Settings → Privacy & Security**)*.
 

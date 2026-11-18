@@ -25,6 +25,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var wallpaperPollTimer: Timer?
     private var wallpaperDebounceWorkItem: DispatchWorkItem?
     private var isApplyingWallpaper: Bool = false
+    private var isAsleep: Bool = false
     private var lastAppliedTime: Date = .distantPast
 
     private var blackBarDirectoryURL: URL {
@@ -210,25 +211,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         )
 
         // 3. Kernel event watcher (kqueue) on wallpaper store directory
-        // Uses 0% CPU while idle; only wakes up when wallpaper configuration is written
-        setupWallpaperStoreKqueue()
-
-        // 4. Low-power fallback timer (every 10s with 5s tolerance to coalesce wakeups)
-        startWallpaperPollTimer()
+        // Uses 0% CPU while idle; only wakes up when wallpaper configuration is written.
+        // Only fall back to a low-frequency timer if kqueue fails to attach.
+        if !setupWallpaperStoreKqueue() {
+            startWallpaperPollTimer()
+        }
     }
 
-    private func setupWallpaperStoreKqueue() {
+    @discardableResult
+    private func setupWallpaperStoreKqueue() -> Bool {
         let storeURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
             .appendingPathComponent("com.apple.wallpaper/Store")
 
-        guard let storePath = storeURL?.path, FileManager.default.fileExists(atPath: storePath) else { return }
+        guard let storePath = storeURL?.path, FileManager.default.fileExists(atPath: storePath) else { return false }
 
         wallpaperStoreDescriptor = open(storePath, O_EVTONLY)
-        guard wallpaperStoreDescriptor >= 0 else { return }
+        guard wallpaperStoreDescriptor >= 0 else { return false }
 
         let source = DispatchSource.makeFileSystemObjectSource(
             fileDescriptor: wallpaperStoreDescriptor,
-            eventMask: [.write, .extend, .attrib],
+            eventMask: [.write, .rename, .delete],
             queue: .main
         )
         source.setEventHandler { [weak self] in
@@ -242,15 +244,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         source.resume()
         wallpaperStoreSource = source
+        return true
     }
 
     private func startWallpaperPollTimer() {
         guard wallpaperPollTimer == nil else { return }
-        let timer = Timer(timeInterval: 10.0, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: 60.0, repeats: true) { [weak self] _ in
             self?.checkForExternalWallpaperChange()
         }
         // Allow timer coalescing to save CPU/battery ticks
-        timer.tolerance = 5.0
+        timer.tolerance = 30.0
         RunLoop.main.add(timer, forMode: .common)
         wallpaperPollTimer = timer
     }
@@ -273,12 +276,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func powerSleepOccurred() {
+        isAsleep = true
+        wallpaperDebounceWorkItem?.cancel()
         stopWallpaperPollTimer()
     }
 
     @objc func powerWakeOccurred() {
-        startWallpaperPollTimer()
-        checkForExternalWallpaperChange()
+        isAsleep = false
+        if wallpaperStoreSource == nil {
+            if !setupWallpaperStoreKqueue() {
+                startWallpaperPollTimer()
+            }
+        }
+        scheduleDebouncedCheck()
     }
 
     @objc func activeSpaceChanged() {
@@ -286,7 +296,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func scheduleDebouncedCheck() {
-        guard isEnabled, !isApplyingWallpaper else { return }
+        guard isEnabled, !isApplyingWallpaper, !isAsleep else { return }
         wallpaperDebounceWorkItem?.cancel()
         let item = DispatchWorkItem { [weak self] in
             self?.checkForExternalWallpaperChange()
@@ -296,7 +306,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func checkForExternalWallpaperChange() {
-        guard isEnabled, !isApplyingWallpaper else { return }
+        guard isEnabled, !isApplyingWallpaper, !isAsleep else { return }
         guard Date().timeIntervalSince(lastAppliedTime) > 2.5 else { return }
 
         var changed = false
@@ -423,17 +433,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let notchHeightPixels = notchHeightPoints * scale
             let desktopTopY = CGFloat(targetPixelHeight) - notchHeightPixels
 
-            guard let rep = NSBitmapImageRep(
-                bitmapDataPlanes: nil,
-                pixelsWide: targetPixelWidth,
-                pixelsHigh: targetPixelHeight,
-                bitsPerSample: 8,
-                samplesPerPixel: 4,
-                hasAlpha: true,
-                isPlanar: false,
-                colorSpaceName: .deviceRGB,
+            let colorSpace = CGColorSpaceCreateDeviceRGB()
+            guard let cgContext = CGContext(
+                data: nil,
+                width: targetPixelWidth,
+                height: targetPixelHeight,
+                bitsPerComponent: 8,
                 bytesPerRow: 0,
-                bitsPerPixel: 0
+                space: colorSpace,
+                bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
             ) else {
                 throw NSError(
                     domain: "BlackBar",
@@ -443,7 +451,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             NSGraphicsContext.saveGraphicsState()
-            let context = NSGraphicsContext(bitmapImageRep: rep)
+            let context = NSGraphicsContext(cgContext: cgContext, flipped: false)
             NSGraphicsContext.current = context
 
             // 1. Fill entire canvas with pure black
@@ -479,10 +487,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 path.addRect(CGRect(x: 0, y: 0, width: widthF, height: desktopTopY))
             }
 
-            if let cgContext = context?.cgContext {
-                cgContext.addPath(path)
-                cgContext.clip()
-            }
+            cgContext.addPath(path)
+            cgContext.clip()
 
             // 3. Draw original wallpaper scaled (aspect fill) inside clipped region
             let originalSize = originalImage.size
@@ -499,7 +505,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
             NSGraphicsContext.restoreGraphicsState()
 
-            guard let pngData = rep.representation(using: .png, properties: [:]) else {
+            guard let cgImage = cgContext.makeImage(),
+                  let pngData = NSBitmapImageRep(cgImage: cgImage).representation(using: .png, properties: [:]) else {
                 throw NSError(
                     domain: "BlackBar",
                     code: 3,
